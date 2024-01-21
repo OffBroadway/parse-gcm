@@ -27,6 +27,13 @@
 #include "lib.h"
 #include "gcm.h"
 
+typedef struct {
+	uint32_t start;
+	uint32_t end;
+} range_t;
+
+static range_t ranges[1000000];
+static size_t ranges_i = 0;
 
 struct gcm_disk_header boot_bin;
 struct gcm_disk_header_info bi2_bin;
@@ -38,6 +45,13 @@ static char buf[BUF_SIZE];
 #define copy_to_null_terminated_buffer(dstbuf, srcbuf) \
 	{ memcpy(dstbuf, srcbuf, sizeof(srcbuf)); \
 	  dstbuf[sizeof(srcbuf)] = 0; }
+
+static void add_to_range(uint32_t start, uint32_t len)
+{
+	printf("adding in use 0x%08X, len 0x%X\n", start, len);
+	ranges[ranges_i].start = start;
+	ranges[ranges_i++].end = start+len;
+}
 
 void die(char* format, ...)
 {
@@ -177,14 +191,14 @@ int dump_file(int fd, struct gcm_file_entry *fe, char *fname)
 
 void print_file_entry(int fd, struct gcm_file_entry *fe, void *fst, char *string_table)
 {
-	unsigned long fname_offset;
+	uint32_t fname_offset;
 	char *fname;
 
 	printf("-- file entry --\n");
 
 	printf("type = %s\n", (fe->flags)?"directory":"file");
 	fname_offset = be32_to_cpu(fe->file.fname_offset) & 0x00ffffff;
-	printf("fname_offset = 0x%08lx\n", fname_offset);
+	printf("fname_offset = 0x%08x\n", fname_offset);
 	printf("fname = %s\n", fname = string_table + fname_offset);
 
 	if (fe->flags) {
@@ -193,6 +207,9 @@ void print_file_entry(int fd, struct gcm_file_entry *fe, void *fst, char *string
 		printf("this_directory_offset = 0x%08x\n",
 			be32_to_cpu(fe->dir.this_directory_offset));
 	} else {
+		
+		add_to_range(be32_to_cpu(fe->file.file_offset), be32_to_cpu(fe->file.file_length));
+		
 		printf("file_offset = 0x%08x\n",
 			be32_to_cpu(fe->file.file_offset));
 		printf("file_length = 0x%08x (%d)\n",
@@ -205,8 +222,8 @@ int parse_directory(int fd, struct gcm_file_entry *fe, struct gcm_file_entry *pa
 		    void *fst, char *string_table)
 {
 //	struct gcm_file_entry *next_fe;
-	unsigned long parent_directory_offset;
-	unsigned long directory_offset;
+	uint32_t parent_directory_offset;
+	uint32_t directory_offset;
 //	unsigned long this_directory_offset;
 
 //	this_directory_offset = be32_to_cpu(fe->dir.this_directory_offset);
@@ -228,13 +245,13 @@ int parse_directory(int fd, struct gcm_file_entry *fe, struct gcm_file_entry *pa
 int parse_fst(int fd, struct gcm_disk_header *dh)
 {
 	void *fst;
-	unsigned long fst_size;
+	uint32_t fst_size;
 	struct gcm_file_entry *fe;
 
 	char *string_table;
-	unsigned long string_table_offset;
+	uint32_t string_table_offset;
 
-	int num_entries;
+	uint32_t num_entries;
 
 	int result;
 
@@ -257,10 +274,10 @@ int parse_fst(int fd, struct gcm_disk_header *dh)
 	string_table = fst + num_entries * sizeof(*fe);
 
 	printf("fst loaded at address %p\n", fst);
-	printf("fst has %d file entries\n", num_entries);
+	printf("fst has %u file entries\n", num_entries);
 
 	printf("string table loaded at address %p\n", string_table);
-	printf("string table located at offset 0x%08lx\n", string_table_offset);
+	printf("string table located at offset 0x%08x\n", string_table_offset);
 
 	/* skip root directory */
 	fe++;
@@ -273,6 +290,73 @@ int parse_fst(int fd, struct gcm_disk_header *dh)
 	}
 	
 	return 0;
+}
+
+
+// Function to compare two ranges for qsort
+int compareRanges(const void *a, const void *b) {
+	range_t *rangeA = (range_t *)a;
+	range_t *rangeB = (range_t *)b;
+	return (rangeA->start - rangeB->start);
+}
+
+// Merge overlapping or adjacent ranges
+int mergeRanges() {
+	if (ranges_i == 0) return 0;
+	
+	qsort(ranges, ranges_i, sizeof(range_t), compareRanges);
+	
+	int j = 0;
+	for (int i = 1; i < ranges_i; i++) {
+		if (ranges[j].end >= ranges[i].start) {
+			if (ranges[j].end < ranges[i].end) {
+				ranges[j].end = ranges[i].end;
+			}
+		} else {
+			j++;
+			ranges[j] = ranges[i];
+		}
+	}
+	return j + 1; // Return the count of merged ranges
+}
+
+// Zero out padding
+void zeroOutPadding(const char *filename) {
+	FILE *file = fopen(filename, "r+b");
+	if (file == NULL) {
+		perror("Error opening file");
+		return;
+	}
+	
+	int rangeCount = mergeRanges();
+	
+	printf("%d ranges in use\n", rangeCount);
+	
+	long currentPos = 0;
+	for (int i = 0; i < rangeCount; i++) {
+		if (currentPos < ranges[i].start) {
+			fseek(file, currentPos, SEEK_SET);
+			printf("Writing zeroes from %ld to %u\n", currentPos, ranges[i].start);
+			long paddingSize = ranges[i].start - currentPos;
+			for (long j = 0; j < paddingSize; j++) {
+				fputc(0, file);
+			}
+		}
+		currentPos = ranges[i].end;
+	}
+	
+	// Handle padding at the end of the file
+	fseek(file, 0, SEEK_END);
+	long fileSize = ftell(file);
+	if (currentPos < fileSize) {
+		fseek(file, currentPos, SEEK_SET);
+		printf("Writing zeroes from %ld to %ld (end of file)\n", currentPos, fileSize);
+		for (long j = currentPos; j < fileSize; j++) {
+			fputc(0, file);
+		}
+	}
+	
+	fclose(file);
 }
 
 /*
@@ -298,6 +382,9 @@ int main(int argc, char *argv[])
 	if (result < 0)
 		die("can't read boot.bin: %s", strerror(errno));
 
+	//For now, let's mark everything up to the end of the FST as in-use
+	add_to_range(0, be32_to_cpu(boot_bin.layout.fst_offset) + be32_to_cpu(boot_bin.layout.fst_size));
+	
 	print_disk_header(&boot_bin);
 
 	result = read(fd, &bi2_bin, sizeof(bi2_bin));
@@ -321,5 +408,6 @@ int main(int argc, char *argv[])
 		die("can't seek to fst.bin position: %s", strerror(errno));
 
 	parse_fst(fd, &boot_bin);
+	zeroOutPadding(argv[1]);
 }
 

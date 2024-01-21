@@ -1,4 +1,4 @@
-TARGET = parse_gcm
+TARGET = strip_gcm
 LIBS = 
 CC = gcc
 CFLAGS = -g -Wall
